@@ -159,3 +159,239 @@ http.response_time:
 1 second can already make a real difference.  
 Only 3_400 out of 27_000 requests were successful!  
 In the real world we would now use something like K8s and scale our application to ensure that we can serve all requests.
+
+### Switching to the new world
+
+I prepared a new branch where I replaced the Spring Web dependency with Spring WebFlux  
+and the NeedANumberController is now using Kotlin coroutines.  
+Please make sure that you are switching the branch.
+
+```
+git checkout the-new-world
+```
+
+### New (non-blocking) world - Need a number - pure calculation
+
+```Kotlin
+    @GetMapping("/need-a-number")
+    suspend fun needANumber(): Int = Random.nextInt(1, 11)
+```
+
+Let us go one step back and use artillery to check if something changed when we have an endpoint without any IO.  
+In the controller we are now using the `suspend` keyword from Kotlin coroutines.  
+Which is much nicer in my opinion then the Mono, Flux stuff we have to use in Java-Land.
+
+```
+http.codes.200: ................................................................ 27000
+http.request_rate: ............................................................. 450/sec
+http.requests: ................................................................. 27000
+http.response_time:
+  min: ......................................................................... 0
+  max: ......................................................................... 145
+  median: ...................................................................... 0
+  p95: ......................................................................... 1
+  p99: ......................................................................... 2
+```
+
+As we can see, **no difference** than in the old (blocking) world.  
+
+```
+learning #1:
+
+Switching from blocking to non-blocking will not upgrade your resources like CPU, memory and Co.
+Sounds obvious, but maybe it helps to know that the limitations of your system will stay the same.
+We "only" change the way how our resources are used.
+Therefor it can happen that it makes no difference.
+We can't expect some magical improvment.
+
+So if your current (blocking) application is fine (healthy and performant)   
+then there is no need (yet) to switch worlds.
+```
+
+### New (non-blocking) world - Need a number - with simulated IO
+
+Now let us see what we have to do, when we want to benefit from the non-blocking world.  
+**Spoiler**: We will start with endpoints that look non-blocking but still suck.
+
+```Kotlin
+    // performs as bad as (blocking) need-a-number plus warning of thread starvation
+    @GetMapping("/need-a-number1")
+    suspend fun needANumber1(): Int = Thread.sleep(1_000L).let { Random.nextInt(1, 11) }
+```
+
+This endpoint looks similar to the one we already know from the blocking world.  
+Again we are simulating IO by using a Thread.sleep.  
+But if you use Intellij then you'll get a warning like this on the Thread.sleep() method:
+```
+Possibly blocking call in non-blocking context could lead to thread starvation
+```
+
+This means "you fucked up, this won't work and is dangerous".  
+We will see what we have to do instead with the next endpoints.
+
+```
+errors.ECONNRESET: ............................................................. 322
+errors.EPIPE: .................................................................. 2
+errors.ETIMEDOUT: .............................................................. 26600
+http.codes.200: ................................................................ 76
+http.request_rate: ............................................................. 394/sec
+http.requests: ................................................................. 27000
+http.response_time:
+  min: ......................................................................... 1000
+  max: ......................................................................... 9764
+  median: ...................................................................... 5826.9
+  p95: ......................................................................... 9801.2
+  p99: ......................................................................... 9801.2
+
+```
+
+No surprise, our results are awful.  
+Only 76 out of 27_000 were successful.  
+I don't think our customers will love it.
+
+### New (non-blocking) world - Need a number - with simulated IO and fix from Intellij
+
+Intellij is nice and provides a solution to this warning:
+```
+Possibly blocking call in non-blocking context could lead to thread starvation
+```
+
+```Kotlin
+    @GetMapping("/need-a-number2")
+    suspend fun needANumber2(): Int = withContext(Dispatchers.IO) {
+        Thread.sleep(1_000L).let { Random.nextInt(1, 11) }
+    }
+```
+
+Our endpoint is now using the `withContext`.
+Let us check the results, before we discuss what is going on.
+
+```
+errors.EADDRNOTAVAIL: .......................................................... 2302
+errors.ETIMEDOUT: .............................................................. 23906
+http.codes.200: ................................................................ 792
+http.request_rate: ............................................................. 394/sec
+http.requests: ................................................................. 27000
+http.response_time:
+  min: ......................................................................... 1001
+  max: ......................................................................... 9992
+  median: ...................................................................... 6064.7
+  p95: ......................................................................... 9801.2
+  p99: ......................................................................... 9999.2
+```
+
+Better bad still awful.  
+Only 792 requests out of 27_000 requests were successfully.  
+But we did what Intellij told us, didn't we?  
+Yes, but we are still doing one big mistake.  
+We are mixing a non-blocking environment with still blocking code.  
+Or in other words, `suspend` and `withContext` can't convert shit into gold.
+The problem is the Thread.sleep as it still blocking the thread.
+But our environment is expecting that we code our IO in a way that idle time will cause a suspension.
+
+```
+learning #2:
+
+No keyword like "suspend" or "withContext" can transform blocking-code into non-blocking.
+```
+
+### New (non-blocking) world - Need a number - with simulated IO and real non-blocking code
+
+```Kotlin
+    @GetMapping("/need-a-number3")
+    suspend fun needANumber3(): Int = delay(1_000L).let { Random.nextInt(1, 11) }
+```
+
+Our endpoint is now using `delay` instead of `Thread.sleep`.  
+Let us check the results.  
+
+```
+http.codes.200: ................................................................ 27000
+http.request_rate: ............................................................. 450/sec
+http.requests: ................................................................. 27000
+http.response_time:
+  min: ......................................................................... 1000
+  max: ......................................................................... 1271
+  median: ...................................................................... 1002.4
+  p95: ......................................................................... 1107.9
+  p99: ......................................................................... 1130.2
+```
+
+Nice! 100% success (fyi: lucky run, sometimes a few requests like ~100 will still fail)  
+Okay what is the difference between `delay` and `Thread.sleep`?  
+
+`delay` is a suspendable function from Kotlin coroutines.  
+So the code now says: 
+```
+Oh I have to wait for a second,  
+please suspend me,  
+the Thread is free for someone else,  
+I will continue in a sec."
+```
+
+With `Thread.sleep` the code instead says:
+```
+Oh I habve to wait for a second,
+but the Thread is mine.
+Noone can use it in the meantime.
+```
+
+And this attitude of `Thread.sleep` becomes dangerous,  
+because in a non-blocking world we assume that we need fewer threads overall as they can do other things  
+as soon as we do (non-blocking) IO.
+So in the end we request fewer threads, but still do blocking stuff and thus chaos is just around the corner.
+
+```
+learning #3:
+
+If you want to do non-blocking, then make sure that all your code is non-blocking!
+For example in Spring use WebClient instead of RestTemplate to talk with other services.
+And also your DB should be connected in a non-blocking way, see https://r2dbc.io/
+
+Otherwise your IO will act like Thread.sleep and
+will still block threads which are now even more limited (as we though we need fewer).
+```
+
+### New (non-blocking) world - Need a number - with simulated IO and real non-blocking code - version 2
+
+I also have this endpoint:
+
+```Kotlin
+    // works as good as need a number3, does it make a difference to use withContext?
+    @GetMapping("/need-a-number4")
+    suspend fun needANumber4(): Int = withContext(Dispatchers.IO) { delay(1_000L).let { Random.nextInt(1, 11) } }
+```
+
+At this point I'm also still learning and wondering if we should use `withContext`?  
+I don't know yet.  
+
+```
+http.codes.200: ................................................................ 27000
+http.request_rate: ............................................................. 450/sec
+http.requests: ................................................................. 27000
+http.response_time:
+  min: ......................................................................... 992
+  max: ......................................................................... 1143
+  median: ...................................................................... 1002.4
+  p95: ......................................................................... 1107.9
+  p99: ......................................................................... 1130.2
+```
+
+Also, nice!
+
+## Summary
+
+* If your current (blocking) application is doing well, don't bother. But please proove it and not assume it ;)
+* Kotlin coroutines are the nices way I see so far to implement non-blocking code.
+* When you want to go non-blocking, then make sure that you go all the way (WebClient, IO)
+
+## Things we missed
+
+This simple example did not speak about
+* doing things async
+* error handling in coroutines
+* testing with coroutines
+* much much more
+
+Thus this is just the beginning ...
+BTW: Will project Loom solve our pain? https://wiki.openjdk.org/display/loom/Main
