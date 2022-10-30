@@ -1,0 +1,12 @@
+config:
+  target: "http://localhost:8080"
+  phases:
+    - duration: 60
+      arrivalRate: 450
+      name: Warm up
+
+scenarios:
+  - name: "In need of a number - not reactive"
+    flow:
+      - get:
+          url: "/need-a-number"
